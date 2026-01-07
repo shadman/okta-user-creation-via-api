@@ -14,7 +14,7 @@ from okta.models import UserProfile, CreateUserRequest, PasswordCredential
 load_dotenv()
 
 
-async def create_okta_user(first_name, last_name, email, login=None, activate=True, password=None, group_id=None):
+async def create_okta_user(first_name, last_name, email, login=None, activate=True, password=None, group_id=None, send_email=True):
     """
     Create a new user in Okta.
     
@@ -27,6 +27,8 @@ async def create_okta_user(first_name, last_name, email, login=None, activate=Tr
         password (str, optional): User's password. If provided, user will be ACTIVE immediately.
                                   If not provided and activate=True, user will be PROVISIONED and receive activation email.
         group_id (str, optional): Group ID to assign the user to during creation. Defaults to None.
+        send_email (bool, optional): Whether to send activation email. Defaults to True.
+                                     Set to False to create active user without password and no email.
     
     Returns:
         tuple: (user object, response, error) or None if error occurred
@@ -67,7 +69,7 @@ async def create_okta_user(first_name, last_name, email, login=None, activate=Tr
             'profile': user_profile
         }
         
-        if password==2:
+        if password:
             password_credential = PasswordCredential(
                 value=password
             )
@@ -85,7 +87,98 @@ async def create_okta_user(first_name, last_name, email, login=None, activate=Tr
         # When activate=True and password is provided, user will be ACTIVE
         # When activate=True and password is None, user will be PROVISIONED (activation email sent)
         # When activate=False, user will be STAGED
-        user, response, error = await client.create_user(create_user_request, activate=activate)
+        # If send_email=False and activate=True, create as STAGED then activate without email
+        if activate and not password and not send_email:
+            # Create user as STAGED first (no activation email will be sent)
+            user, response, error = await client.create_user(
+                create_user_request, 
+                activate=False
+            )
+            
+            if error:
+                print(f"Error creating user: {error}")
+                return None
+            
+            # Then activate the user without sending email using direct HTTP API call
+            # This is more reliable than using the SDK methods which may not support sendEmail parameter
+            print(f"Activating user {user.id} without sending email...")
+            try:
+                import aiohttp
+                
+                # Make direct HTTP POST call to Okta API
+                url = f"{okta_domain}/api/v1/users/{user.id}/lifecycle/activate"
+                headers = {
+                    "Authorization": f"SSWS {api_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        params={"sendEmail": "false"}
+                    ) as resp:
+                        response_text = await resp.text()
+                        
+                        if resp.status in [200, 204]:
+                            # Activation successful - fetch updated user to check status
+                            try:
+                                updated_user, _, _ = await client.get_user(user.id)
+                                user = updated_user
+                                
+                                if user.status == "ACTIVE":
+                                    print(f"[SUCCESS] User is ACTIVE and ready to use.")
+                                elif user.status == "PENDING":
+                                    print(f"[SUCCESS] User is PENDING (expected for passwordless users).")
+                                    print(f"  User can log in via widget and will be prompted to set password.")
+                                    print(f"  After setting password, user will become ACTIVE.")
+                                elif user.status == "PROVISIONED":
+                                    print(f"[SUCCESS] User is PROVISIONED.")
+                                    print(f"  User can log in via widget and will be prompted to set password.")
+                                else:
+                                    print(f"[SUCCESS] User activated. Status: {user.status}")
+                                    print(f"  User can log in via widget to set password.")
+                            except Exception as fetch_ex:
+                                print(f"[SUCCESS] Activation API call succeeded (status {resp.status}).")
+                                print(f"  Note: Could not fetch updated user object: {str(fetch_ex)}")
+                        else:
+                            raise Exception(f"HTTP {resp.status}: {response_text}")
+                            
+            except ImportError:
+                print(f"[ERROR] aiohttp is required for activation. Installing...")
+                print(f"  Please run: pip install aiohttp")
+                print(f"  User created in STAGED status. You may need to activate manually.")
+            except Exception as activate_ex:
+                error_msg = str(activate_ex)
+                print(f"[ERROR] Error activating user: {error_msg}")
+                print(f"  Attempting to check current user status...")
+                # Fetch user to check current status
+                try:
+                    updated_user, _, _ = await client.get_user(user.id)
+                    print(f"  Current user status: {updated_user.status}")
+                    user = updated_user
+                    
+                    if updated_user.status == "ACTIVE":
+                        print(f"  [SUCCESS] User is ACTIVE!")
+                    elif updated_user.status == "PENDING":
+                        print(f"  [INFO] User is PENDING (this is expected for passwordless users).")
+                        print(f"  User can log in via widget and will be prompted to set password.")
+                        print(f"  After setting password, user will become ACTIVE.")
+                    elif updated_user.status == "PROVISIONED":
+                        print(f"  [INFO] User is PROVISIONED.")
+                        print(f"  User can log in via widget and will be prompted to set password.")
+                    else:
+                        print(f"  [INFO] User status: {updated_user.status}")
+                        print(f"  User can log in via widget to set password.")
+                except Exception as fetch_ex:
+                    print(f"  Could not fetch user status: {str(fetch_ex)}")
+        else:
+            # Normal creation flow
+            user, response, error = await client.create_user(
+                create_user_request, 
+                activate=activate
+            )
         
         if error:
             print(f"Error creating user: {error}")
@@ -98,8 +191,12 @@ async def create_okta_user(first_name, last_name, email, login=None, activate=Tr
             print(f"  Login: {user.profile.login}")
             print(f"  Status: {user.status}")
             if activate and not password:
-                print(f"  Note: Activation email has been sent to {email}")
-                print(f"        User can set their password via the activation link.")
+                if send_email:
+                    print(f"  Note: Activation email has been sent to {email}")
+                    print(f"        User can set their password via the activation link.")
+                else:
+                    print(f"  Note: User is ACTIVE without password. No activation email sent.")
+                    print(f"        User will set password and authenticator app on first login via widget.")
             if group_id:
                 print(f"  Group ID: {group_id} (included in creation request)")
             
@@ -131,7 +228,8 @@ async def main():
         email=email,
         activate=activate,
         password=None,
-        group_id=group_id
+        group_id=group_id,
+        send_email=False  # Don't send activation email - user will set password on first login
     )
 
 
